@@ -3,6 +3,7 @@ title: "First ggplot"
 author: "SD"
 ---
 
----{R}
+---{r}
 library(ggplot)
 ---
+
