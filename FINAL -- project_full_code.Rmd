@@ -1,0 +1,327 @@
+---
+title: "EEB313 Project: Complete cleaned-up code"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+##Setup: required libraries
+
+```{r setup, message=F, echo = F}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(maps)
+library(sp)
+library(sf)
+library(s2)
+library(rgdal)
+library(mapproj)
+library(ggfortify)
+library(usethis)
+library(ggmap)
+library(mapview)
+library(arules)
+library(stringr)
+library(lme4)
+library(lmerTest)
+library(nlme)
+library(MuMIn)
+library(report)
+library(geosphere)
+library(osmdata)
+library(arsenal)
+```
+
+##Input data
+
+```{r read_data}
+morph <- read.csv("Morphology_metadata2.csv")
+```
+
+##PCA
+
+```{r PCA grouping}
+morph_means <- morph %>% 
+  group_by(Species) %>%
+  filter(!is.na(Wing) & !is.na(Culmen) & !is.na(Mass)) %>%
+  summarize(mean(Wing), mean(Culmen), mean(Mass))
+```
+
+```{r PCA and graph}
+df <- data.frame(morph_means[,-1])
+
+morph_pc <- prcomp(df, scale = TRUE, center = TRUE, retx = T)
+summary(morph_pc)
+
+morph_pc$rotation <- -1*morph_pc$rotation
+morph_pc$rotation
+
+autoplot(morph_pc, data = morph_means, colour = 'Species', loadings = TRUE, 
+         loadings.label = TRUE) +
+labs(title = "Morph Biplot for Hawaii 'Big' Island") +
+theme_classic()
+
+plot(morph_pc)
+```
+
+##Conversion to lat-long and adding landmarks
+
+```{r spatial_view, message = F}
+# Identifies ESPG as 6334.
+morph_sf <- st_as_sf(morph, coords = c("UTM_X", "UTM_Y"), crs = 6334)
+
+# Transforms coordinates to standard lat-lon format.
+morph_wgs84 <- st_transform(morph_sf, crs = 4326)
+
+# Converts geometry class into separate lat-lon columns.
+morph <- morph_wgs84 %>% 
+  extract(geometry, c('lon', 'lat'), '\\((.*), (.*)\\)', convert = TRUE) %>% 
+  as.data.frame()
+
+# Selects for relavent columns.
+morph_spa <- morph %>% 
+  select(Species, Date, Sex, Wing, Culmen, Mass, lat, lon)
+
+# Previews the data.
+#head(morph_spa)
+
+# Uses ggmap to extract map of Hawaii.
+register_google(key = "AIzaSyCAOX4U9l7oFpljVfFnF1U-IW-0ve92QTk")
+map_hi <- get_map(location = 'Island of Hawaii', zoom = 9, source = "stamen", 
+                  maptype = "toner-lite")
+
+# List of natural and anthropogenic effects that can be analyzed.
+effects <- list(Mauna_Loa = c(geocode("Mauna Loa"), Type = "Volcano"),
+                Kīlauea = c(geocode("Kīlauea"), Type = "Volcano"),
+                Hilo = c(geocode("Hilo"), Type = "Urban"),
+                Waimea = c(geocode("Waimea"), Type = "Urban"),
+                Kona = c(geocode("Kona"), Type = "Urban"),
+                Hualalai = c(geocode("Hualalai"), Type = "Mountain"),
+                Mauna_Kea = c(geocode("Mauna Kea Access Rd, Hilo, HI 96720, United States"), 
+                              Type = "Mountain"),
+                Pohakuloa = c(geocode("Pohakuloa Training Area"), Type = "Military"),
+                Army_Reserve = c(geocode("470 W Lanikaula St, Hilo, HI 96720, United States"), 
+                                 Type = "Military"))
+
+# Formats list as a dataframe.
+effects <- as.data.frame(bind_rows(effects, .id = "Name"))
+
+# Plots the data.
+
+ggmap(map_hi) +
+  geom_count(data = morph_spa, aes(x = lon, y = lat), alpha = 0.5) +
+  labs(title = "Observations on \nHawaii 'Big' Island", x = "Longitude", y = "Latitude", 
+       size = "Number of \nObservations") +
+  geom_point(data = effects, aes(x = lon, y = lat, shape = Type), color = "Red")
+
+```
+
+##Distance to landmarks calculation
+
+```{r Distance of points from Landmarks calculation loop}
+#extract points lat-long data into a matrix
+points <- as.matrix(morph_spa[,7:8])
+
+#names of the distance columns in a list
+name_loc <- c("dist_mau_loa","dist_kil","dist_hil","dist_wai","dist_kon",
+              "dist_hua","dist_mau_kea","dist_poh","dist_arm_res")
+
+#Distance calculation for loop
+for(i in 1:9){
+  loc <- as.numeric(c(effects[i,3], effects[i,2]))
+  dist_x <-  as.data.frame(spDistsN1(points,loc,longlat=T))
+  colnames(dist_x) <- name_loc[i]
+  morph_spa <- cbind(morph_spa,dist_x)
+}
+```
+
+##Distance to shoreline calculation
+
+```{r calculate unique shoreline distances, warning = F}
+
+# Uses the previously created sf_object to identify unique sample sites.
+morph_wgs84_distinct <- morph_wgs84 %>% 
+  distinct(geometry)
+
+
+
+# Creates a bounding box of Hawaii coastline data.
+osm_box <- getbb(place_name = "Hawaii") %>%
+  opq() %>% 
+  add_osm_feature("natural", "coastline") %>% 
+  osmdata_sf() 
+
+
+# Uses the dist2line function in geosphere.
+dist_coast <- geosphere::dist2Line(p = st_coordinates(morph_wgs84_distinct), 
+                        line = st_coordinates(osm_box$osm_lines)[,1:2])
+
+# Creates a lat lon version of unique sampling sites.
+morph_spa_distinct <- morph_spa %>% 
+  distinct(lat, lon)
+
+# Combine initial data with distance to coastline.
+morph_spa_coast.distance <- cbind(morph_spa_distinct %>% 
+                                      rename(y = lat, x = lon), dist_coast) %>%
+                                      mutate(kilometers = distance/1000)
+
+# Plot distances
+ggmap(map_hi) + 
+  geom_point(data = morph_spa_distinct,
+             aes(x = lon, y = lat)) +
+  geom_segment(data = morph_spa_coast.distance,
+               aes(x = x, 
+                   y = y, 
+                   xend = lon, 
+                   yend = lat))
+  
+
+```
+
+```{r shoreline distances Binning}
+morph_spa_coast.binned <- morph_spa_coast.distance %>% 
+  mutate(shr_bin = discretize(kilometers, method="interval", breaks=3, 
+                              labels=c("near","middle","far")))
+```
+
+```{r Binding with original dataframe, and convert shoreline distance bins to factor}
+morph_spa <- left_join(morph_spa, morph_spa_coast.binned %>% 
+                         select(y, shr_bin),
+                       by = c("lat" = "y"))
+morph_spa$shr_bin <- as.character(morph_spa$shr_bin)
+```
+
+##Filtering out N/A values
+
+```{r Filter NA}
+#Filter out NAs
+morph_spa_noNA <- morph_spa %>% 
+  filter(!is.na(Wing) & !is.na(Culmen) & !is.na(Mass))
+```
+
+##Binning distance to random effects
+
+```{r Bin Random Effects}
+#Sort Natural Landmarks (random effect) into categories
+morph_spa_bins <- morph_spa_noNA %>% 
+  mutate(mau_loa_bins = discretize(dist_mau_loa, method="interval", breaks=3, 
+                                   labels=c("near","middle","far"))) %>% 
+  mutate(kil_bins = discretize(dist_kil, method="interval", breaks=3, 
+                               labels=c("near","middle","far"))) %>% 
+  mutate(hua_bins = discretize(dist_hua, method="interval", breaks=3, 
+                               labels=c("near","middle","far"))) %>% 
+  mutate(mau_kea_bins = discretize(dist_mau_kea, method="interval", breaks=3, 
+                                   labels=c("near","middle","far")))
+```
+
+##Numericise Year
+
+```{r Numericise Year}
+#Extract last 2 digits -- Years as numeric variable
+morph_spa_bins <- morph_spa_bins %>% 
+  mutate(Year=as.numeric(str_sub(morph_spa_bins$Date,-2,-1)))
+```
+
+##Base Linerar Mixed Models
+
+Here are the base linear mixed models, one for each of the morphological traits. Note that all fixed effects, random effects and covariate (year) are included.
+
+```{r Mixed model: Wing}
+#Mixed model for Wing
+wing_lmer <- lmer(Wing~Year+dist_hil+dist_wai+dist_kon+dist_poh+dist_arm_res+
+                    (1|mau_loa_bins)+(1|kil_bins)+(1|hua_bins)+(1|mau_kea_bins)+
+                    (1|shr_bin),data=morph_spa_bins,REML=F)
+summary(wing_lmer)
+```
+
+```{r Mixed model: Culmen}
+#Mixed model for Culmen
+cul_lmer <- lmer(Culmen~Year+dist_hil+dist_wai+dist_kon+dist_poh+dist_arm_res+
+                   (1|mau_loa_bins)+(1|kil_bins)+(1|hua_bins)+(1|mau_kea_bins)+
+                   (1|shr_bin),data=morph_spa_bins,REML=F)
+summary(cul_lmer)
+```
+
+```{r Mixed model: Mass}
+#Mixed model for Mass
+mas_lmer <- lmer(Mass~Year+dist_hil+dist_wai+dist_kon+dist_poh+dist_arm_res+
+                   (1|mau_loa_bins)+(1|kil_bins)+(1|hua_bins)+(1|mau_kea_bins)+
+                   (1|shr_bin),data=morph_spa_bins,REML=F)
+summary(mas_lmer)
+```
+
+##Model Dredging
+
+Model Dredging using MuMIn function dredge()
+
+```{r Wing Dredge, warning=FALSE}
+wing_lmer_full <- lmer(Wing~Year+dist_hil+dist_wai+dist_kon+dist_poh+dist_arm_res+
+                         (1|mau_loa_bins)+(1|kil_bins)+(1|hua_bins)+(1|mau_kea_bins)+
+                         (1|shr_bin),data=morph_spa_bins,REML=F, na.action="na.fail")
+
+wing_dredge <- dredge(wing_lmer_full, rank=AICc)
+wing_dredge
+```
+
+```{r Culmen Dredge, warning=FALSE}
+cul_lmer_full <- lmer(Culmen~Year+dist_hil+dist_wai+dist_kon+dist_poh+dist_arm_res+
+                        (1|mau_loa_bins)+(1|kil_bins)+(1|hua_bins)+(1|mau_kea_bins)+
+                        (1|shr_bin),data=morph_spa_bins,REML=F, na.action="na.fail")
+
+cul_dredge <- dredge(cul_lmer_full, rank=AICc)
+cul_dredge
+```
+
+
+```{r Mass Dredge, warning=FALSE}
+mass_lmer_full <- lmer(Mass~Year+dist_hil+dist_wai+dist_kon+dist_poh+dist_arm_res+
+                         (1|mau_loa_bins)+(1|kil_bins)+(1|hua_bins)+(1|mau_kea_bins)+
+                         (1|shr_bin),data=morph_spa_bins,REML=F, na.action="na.fail")
+
+mass_dredge <- dredge(mass_lmer_full, rank=AICc)
+mass_dredge
+```
+
+##Model Averaging (after dredge)
+
+```{r Model average - Wing}
+top_wing_avg <- model.avg(wing_dredge, subset = delta <=2)
+summary(top_wing_avg)
+```
+
+```{r Model average - Culmen}
+top_cul_avg <- model.avg(cul_dredge, subset = delta <=2)
+summary(top_cul_avg)
+```
+
+```{r Model average - Mass}
+top_mass_avg <- model.avg(mass_dredge, subset = delta <=2)
+summary(top_mass_avg)
+```
+
+```{r coefficients as table}
+coefTable(top_wing_avg,full=T)
+coefTable(top_cul_avg,full=T)
+coefTable(top_mass_avg,full=T)
+```
+
+#Appendix A; exporting cleaned-up Dataset
+
+```{r csv exports}
+write.csv(morph_spa_bins, "Cleaned_Dataset_final.csv", row.names = FALSE)
+```
+
+## R package Citations
+
+```{r citations}
+packs <- c("tidyverse","ggplot2","maps","sp","sf","s2","rgdal","mapproj","ggfortify","usethis",
+           "ggmap","mapview","arules","stringr","lme4","lmerTest","nlme","MuMIn","report",
+           "geosphere","osmdata","arsenal")
+for(i in 1:length(packs)){
+  citation(packs[i])
+}
+```
+
